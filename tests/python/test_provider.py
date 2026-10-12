@@ -384,13 +384,14 @@ def _setup_instance(monkeypatch, instance_id, values):
     return instance
 
 
-def _setup_cookie_instance(monkeypatch, instance_id, *, library, account_info):
+def _setup_cookie_instance(monkeypatch, instance_id, *, library, account_info, extra_config=None):
     """Run handle_async_init with cookie auth and a scripted ytmusicapi client."""
     instance = _make_provider(instance_id)
     instance.config = _StubConfig(
         {
             ytm.CONF_AUTH_TYPE: ytm.AUTH_TYPE_COOKIE,
             ytm.CONF_COOKIE: "__Secure-3PAPISID=abc; SID=def",
+            **(extra_config or {}),
         }
     )
     _forbid_open(monkeypatch)
@@ -5941,3 +5942,891 @@ def test_one_unparseable_library_item_does_not_fail_the_whole_sync(provider):
     tracks = _consume(provider.get_library_tracks())
 
     assert [t.item_id for t in tracks] == ["v1"]
+
+
+# ---------------------------------------------------------------------------
+# Home feed recommendations on Music Assistant 2.9 and 2.10 (issue #96)
+#
+# 2.10 replaced recommendations() with get_recommendations() (rows only) and
+# get_recommendation_items(item_id), and its base versions raise once
+# RECOMMENDATIONS is declared. The feed also lost every playlist, mix, album
+# and podcast card to a dispatch that never matched their shapes.
+# ---------------------------------------------------------------------------
+
+
+def _home_thumbs(key, sizes=(226, 544)):
+    """Square googleusercontent covers, the shape home feed cards carry."""
+    return [
+        {
+            "url": f"https://yt3.googleusercontent.com/{key}=w{size}-h{size}-l90-rj",
+            "width": size,
+            "height": size,
+        }
+        for size in sizes
+    ]
+
+
+# Trimmed from a real unauthenticated get_home(limit=20) taken with ytmusicapi
+# 1.12.1: every row title in payload order, one or two cards each, keys exactly
+# as ytmusicapi emits them.
+_HOME_FEED = [
+    {
+        "title": "Quick picks",
+        "contents": [
+            {
+                "title": "Patient Zero",
+                "videoId": "V-uIp-WuD60",
+                "videoType": "MUSIC_VIDEO_TYPE_ATV",
+                "thumbnails": _home_thumbs("DNFuGZeu", (60, 120)),
+                "isExplicit": False,
+                "artists": [{"name": "Taylor Swift", "id": "UCPC0L1d253x-KuMNwa05TpA"}],
+                "views": "39M",
+                "album": {"name": "The Life of a Showgirl", "id": "MPREb_L64BnYDQpHZ"},
+            },
+            {
+                "title": "Nur ein Lied",
+                "videoId": "jc4A-1KJAZU",
+                "videoType": "MUSIC_VIDEO_TYPE_ATV",
+                "thumbnails": _home_thumbs("GaKpiRac", (60, 120)),
+                "isExplicit": False,
+                "artists": [{"name": "Kerstin Ott", "id": "UCVAvAvPCnScF3XoFPzvep7g"}],
+                "views": "480K",
+                "album": {"name": "Nur ein Lied", "id": "MPREb_03kJUBdSY8D"},
+            },
+        ],
+    },
+    {
+        "title": "Sunday breakfast",
+        "contents": [
+            {
+                "title": "Feel-Good Pop & Rock",
+                "playlistId": "RDCLAK5uy_m0wlRoNn5iCTTgBedfoOQ19Jq9P3XTLIA",
+                "thumbnails": _home_thumbs("CTtOLB0z"),
+                "description": "Ed Sheeran, Imagine Dragons, HAIM, Taylor Swift",
+            }
+        ],
+    },
+    {
+        "title": "Today's biggest hits",
+        "contents": [
+            {
+                "title": "phonk",
+                "playlistId": "RDCLAK5uy_ljm2pVSIkXSIKp1im9yxV0XgLmkBbGR-E",
+                "thumbnails": _home_thumbs("IbSKJjPQ"),
+                "description": "Eternxlkz, Kordhell, MXZI, Sayfalse",
+            }
+        ],
+    },
+    {
+        "title": "New releases",
+        "contents": [
+            {
+                "title": "Nashville",
+                "artists": [
+                    {"id": "UC2fL1mkImUx_l_YELcZjoJw", "name": "Peter Maffay"},
+                    {"id": "UC_d8ngsw0fyDErICrkgNqAQ", "name": "Johannes Oerding"},
+                ],
+                "browseId": "MPREb_RFyWgIEomZB",
+                "audioPlaylistId": "OLAK5uy_lVgDz3DvGnVAat22sKrb7Ujlatnzhwd6w",
+                "thumbnails": _home_thumbs("igyaHYdd"),
+                "isExplicit": False,
+                "type": "Album",
+            }
+        ],
+    },
+    {
+        "title": "100% Hits",
+        "contents": [
+            {
+                "title": "Pop Gold",
+                "playlistId": "RDCLAK5uy_nHSqCJjDrW9HBhCNdF6tWPdnOMngOv0wA",
+                "thumbnails": _home_thumbs("rAUuEbLF"),
+                "description": "Alicia Keys, Ed Sheeran, Adele, Lewis Capaldi",
+            }
+        ],
+    },
+    {
+        "title": "Throwback",
+        "contents": [
+            {
+                "title": "'80s Pop",
+                "playlistId": "RDCLAK5uy_k1Wu8QbZASiGVqr1wmie9NIYo38aBqscQ",
+                "thumbnails": _home_thumbs("zcEHBRn_"),
+                "description": "George Michael, Michael Jackson, Madonna, Prince",
+            }
+        ],
+    },
+    {
+        "title": "Featured playlists for you",
+        "contents": [
+            {
+                "title": "Trending 20 Germany",
+                "playlistId": "OLAK5uy_nPQBmQpOIYYxuvYW4gIHsjgDqX9kc--Dg",
+                "thumbnails": [
+                    {"url": "https://yt3.googleusercontent.com/byh7J_ct=s192", "width": 192, "height": 192},
+                    {"url": "https://yt3.googleusercontent.com/byh7J_ct=s576", "width": 576, "height": 576},
+                ],
+                "description": "Chart - YouTube Charts",
+            }
+        ],
+    },
+]
+
+_BLOCKED_ID = "UC000000000000000000000a"
+
+
+def _home_song(video_id="vid00000001", title="Good", artist="Real Band", artist_id="UC000000000000000000000b"):
+    return {
+        "title": title,
+        "videoId": video_id,
+        "playlistId": "RDAMVM" + video_id,
+        "thumbnails": _home_thumbs("song", (60, 120)),
+        "artists": [{"name": artist, "id": artist_id}],
+    }
+
+
+def _home_album(browse_id="MPREb_bot", artist="Sloppy Bot", artist_id=_BLOCKED_ID, album_type="Album"):
+    return {
+        "title": "Generated Album",
+        "artists": [{"id": artist_id, "name": artist}],
+        "browseId": browse_id,
+        "audioPlaylistId": "OLAK5uy_bot",
+        "thumbnails": _home_thumbs("album"),
+        "isExplicit": False,
+        "type": album_type,
+    }
+
+
+def _home_community_playlist(playlist_id="PLbot", author="Sloppy Bot", author_id=_BLOCKED_ID):
+    """parse_playlist output for a playlist whose subtitle names its author."""
+    return {
+        "title": "Bot Picks",
+        "playlistId": playlist_id,
+        "thumbnails": _home_thumbs("playlist"),
+        "description": f"{author} \u2022 50 songs",
+        "count": "50",
+        "author": [{"name": author, "id": author_id}],
+    }
+
+
+def _home_mix(playlist_id="RDTMAK5uy_mix", title="My Supermix"):
+    """parse_watch_playlist output: playlistId, title and thumbnails only."""
+    return {"title": title, "playlistId": playlist_id, "thumbnails": _home_thumbs("mix")}
+
+
+def _home_artist_card(browse_id=_BLOCKED_ID, title="Sloppy Bot"):
+    return {
+        "title": title,
+        "browseId": browse_id,
+        "subscribers": "1.2M",
+        "thumbnails": _home_thumbs("artist"),
+    }
+
+
+def _home_provider(provider, home=None, *, authenticated=True):
+    """Point the provider at a scripted get_home and mark it signed in."""
+    provider._authenticated = authenticated
+    mock = MagicMock()
+    mock.get_home = MagicMock(return_value=json.loads(json.dumps(home if home is not None else _HOME_FEED)))
+    provider._ytmusic = mock
+    return mock
+
+
+def _row_items(provider, row_id):
+    return asyncio.run(provider.get_recommendation_items(row_id))
+
+
+# Hook wiring ----------------------------------------------------------------
+
+
+def test_210_hooks_are_overridden_under_the_declared_features():
+    """Built the way setup() builds every instance, anonymous ones included.
+
+    The stub base raises here exactly like 2.10 does, which is the failure the
+    issue reported: 1.2.1 never overrode either hook.
+    """
+    instance = ytm.YoutubeMusicFreeProvider(
+        mass=None, manifest=None, config=None,
+        supported_features=ytm.BASE_FEATURES | ytm.AUTHENTICATED_FEATURES,
+    )
+    instance._ytmusic = None
+    instance._authenticated = False
+    base = sys.modules["music_assistant.models.music_provider"].MusicProvider
+    with pytest.raises(NotImplementedError):
+        asyncio.run(base.get_recommendations(instance))
+
+    assert asyncio.run(instance.get_recommendations()) == []
+    assert list(asyncio.run(instance.get_recommendation_items("ytm_rec_quick_picks"))) == []
+
+
+def test_29_hook_is_kept(provider):
+    """Music Assistant 2.9 and 2.10.0b0 to b7 call only this one."""
+    assert "recommendations" in vars(ytm.YoutubeMusicFreeProvider)
+    _home_provider(provider)
+
+    rows = asyncio.run(provider.recommendations())
+
+    assert rows and all(row.items for row in rows)
+
+
+# Rows and items -------------------------------------------------------------
+
+
+def test_rows_come_back_without_items(provider):
+    _home_provider(provider)
+
+    rows = asyncio.run(provider.get_recommendations())
+
+    assert [row.name for row in rows] == [section["title"] for section in _HOME_FEED]
+    assert all(list(row.items) == [] for row in rows)
+    assert all(row.provider == provider.instance_id for row in rows)
+
+
+def test_row_items_are_that_rows_items(provider):
+    _home_provider(provider)
+    full = asyncio.run(provider.recommendations())
+    rows = asyncio.run(provider.get_recommendations())
+
+    # Guards the loop below, which would pass vacuously on zero rows.
+    assert len(rows) == len(_HOME_FEED)
+    for row in rows:
+        expected = next(folder for folder in full if folder.item_id == row.item_id)
+        assert list(_row_items(provider, row.item_id)) == list(expected.items)
+
+
+def test_unknown_row_id_returns_an_empty_unique_list(provider):
+    _home_provider(provider)
+
+    items = _row_items(provider, "ytm_rec_no_such_row")
+
+    assert isinstance(items, ytm.UniqueList)
+    assert len(items) == 0
+
+
+def test_29_and_210_hooks_agree(provider):
+    _home_provider(provider)
+
+    old = asyncio.run(provider.recommendations())
+    new_rows = asyncio.run(provider.get_recommendations())
+
+    assert [(r.item_id, r.name) for r in old] == [(r.item_id, r.name) for r in new_rows]
+    assert [list(r.items) for r in old] == [list(_row_items(provider, r.item_id)) for r in new_rows]
+
+
+def test_new_hooks_empty_when_not_authenticated(provider):
+    mock = _home_provider(provider, authenticated=False)
+
+    assert asyncio.run(provider.get_recommendations()) == []
+    assert list(_row_items(provider, "ytm_rec_quick_picks")) == []
+    mock.get_home.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda p: p.recommendations(),
+        lambda p: p.get_recommendations(),
+        lambda p: p.get_recommendation_items("ytm_rec_quick_picks"),
+    ],
+    ids=["recommendations", "get_recommendations", "get_recommendation_items"],
+)
+def test_new_hooks_swallow_a_lapsed_cookie(provider, call):
+    """A raise here reaches the 2.10 browse page as error 999."""
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    handler = _attach_capture(provider)
+    mock = MagicMock()
+    mock.get_home = MagicMock(side_effect=RuntimeError("Server returned HTTP 401: Unauthorized"))
+    provider._ytmusic = mock
+
+    assert list(asyncio.run(call(provider))) == []
+    assert "cookie" in " ".join(handler.messages()).lower()
+
+
+def test_home_feed_lapse_raises_the_auth_notice(provider):
+    provider._authenticated = True
+    provider._auth_notice = None
+    _attach_capture(provider)
+    mock = MagicMock()
+    mock.get_home = MagicMock(side_effect=RuntimeError("Server returned HTTP 401: Unauthorized"))
+    provider._ytmusic = mock
+
+    asyncio.run(provider.get_recommendations())
+
+    assert provider._auth_notice is not None
+
+
+# Caching --------------------------------------------------------------------
+
+
+def test_home_feed_is_cached():
+    """Only parameters Music Assistant 2.9's use_cache also has.
+
+    No cache_none in particular: it exists only on 2.10, and passing it would
+    stop the provider importing on 2.9. cache_checksum is safe, it has been
+    there since 2.7.
+    """
+    cache = ytm.YoutubeMusicFreeProvider._get_home_feed.__ma_cache__
+    assert cache == {
+        "expiration": ytm.HOME_FEED_CACHE_TTL,
+        "allow_expired_cache": True,
+        "cache_checksum": str(ytm.HOME_FEED_ROW_LIMIT),
+    }
+
+
+def test_home_feed_checksum_retires_a_feed_fetched_with_another_limit():
+    """The checksum is the row limit, so changing the limit retires old entries.
+
+    Music Assistant only compares a checksum it was given a truthy value for
+    (``not checksum or row["checksum"] == checksum``), and 1.2.2 stored its
+    six-shelf feed without one. A non-empty checksum is what turns that entry
+    into a miss on the first read after updating, instead of it being served
+    until its hour runs out. Issue #96.
+    """
+    checksum = ytm.YoutubeMusicFreeProvider._get_home_feed.__ma_cache__["cache_checksum"]
+    assert checksum == str(ytm.HOME_FEED_ROW_LIMIT)
+    assert checksum, "a falsy checksum is never compared, so it would retire nothing"
+
+
+def test_home_feed_limit_reaches_the_shelves_logged_in_feeds_put_low():
+    """A floor, so the limit cannot slide back to where 1.2.2 had it.
+
+    In the logged-in feed shared on issue #96, "Albums for you", "New
+    releases" and "Mixed for you" came 12th to 14th. ytmusicapi stops asking
+    for more shelves once it holds the limit, so six never reached them.
+    """
+    assert ytm.HOME_FEED_ROW_LIMIT >= 14
+
+
+def test_home_feed_raises_instead_of_returning_empty(provider):
+    """Every server line caches [] like any other value; a failure must not be."""
+    provider._authenticated = True
+    _attach_capture(provider)
+    mock = MagicMock()
+    mock.get_home = MagicMock(side_effect=RuntimeError("boom"))
+    provider._ytmusic = mock
+
+    with pytest.raises(RuntimeError, match="boom"):
+        asyncio.run(provider._get_home_feed(""))
+
+
+def test_home_feed_is_fetched_with_the_row_limit(provider):
+    mock = _home_provider(provider)
+
+    asyncio.run(provider.get_recommendations())
+
+    mock.get_home.assert_called_once_with(limit=ytm.HOME_FEED_ROW_LIMIT)
+
+
+def test_home_feed_cache_key_carries_the_account(provider):
+    _home_provider(provider)
+    provider._home_feed_account = "123:1"
+    seen = []
+
+    async def _fake_feed(account):
+        seen.append(account)
+        return []
+
+    provider._get_home_feed = _fake_feed
+    asyncio.run(provider.get_recommendations())
+
+    assert seen == ["123:1"]
+
+
+def test_cookie_init_records_the_home_feed_account(monkeypatch):
+    instance, _ = _setup_cookie_instance(
+        monkeypatch,
+        "inst_home_account",
+        library=[{"videoId": "v1", "title": "x"}],
+        account_info={"accountName": "Real"},
+        extra_config={ytm.CONF_BRAND_ACCOUNT: "123", ytm.CONF_AUTH_USER: 1},
+    )
+
+    assert instance._authenticated is True
+    assert instance._home_feed_account == "123:1"
+
+
+def test_filter_applies_on_top_of_the_cached_payload(provider):
+    """The cache holds the raw feed, so a blocklist edit applies on the next read."""
+    home = [
+        {
+            "title": "Listen again",
+            "contents": [_home_song(), _home_song("vid00000002", "Slop", "Sloppy Bot", _BLOCKED_ID)],
+        }
+    ]
+    mock = _home_provider(provider, home)
+
+    provider._ai_filter_enabled = False
+    assert len(_row_items(provider, "ytm_rec_listen_again")) == 2
+
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    assert [t.name for t in _row_items(provider, "ytm_rec_listen_again")] == ["Good"]
+
+    raw = asyncio.run(provider._get_home_feed(""))
+    assert raw == mock.get_home.return_value
+    assert len(raw[0]["contents"]) == 2
+
+
+# Row ids --------------------------------------------------------------------
+
+
+def test_row_ids_have_no_slash_and_survive_browse_split():
+    """2.10's base browse keeps only the second path segment."""
+    (row_id,) = ytm._home_row_ids(["Rock/Pop"])
+
+    assert row_id == "ytm_rec_rock_pop"
+    path = f"ytmusic_free--x://recommendations/{row_id}"
+    assert path.split("://", 1)[1].split("/")[1] == row_id
+
+
+def test_duplicate_titles_get_distinct_ids(provider):
+    home = [
+        {"title": "Mix", "contents": [_home_song("vid00000001", "First")]},
+        {"title": "Mix", "contents": [_home_song("vid00000002", "Second")]},
+    ]
+    _home_provider(provider, home)
+
+    rows = asyncio.run(provider.get_recommendations())
+
+    assert [row.item_id for row in rows] == ["ytm_rec_mix", "ytm_rec_mix_2"]
+    assert [t.name for t in _row_items(provider, "ytm_rec_mix")] == ["First"]
+    assert [t.name for t in _row_items(provider, "ytm_rec_mix_2")] == ["Second"]
+
+
+def test_a_suffixed_title_cannot_collide_with_a_numbered_duplicate():
+    assert ytm._home_row_ids(["Mix", "Mix", "Mix 2"]) == [
+        "ytm_rec_mix",
+        "ytm_rec_mix_2",
+        "ytm_rec_mix_2_2",
+    ]
+
+
+def test_simple_titles_keep_their_121_id():
+    assert ytm._home_row_ids(["Quick picks"]) == ["ytm_rec_quick_picks"]
+
+
+def test_row_ids_ignore_the_filter(provider):
+    """An emptied first row must not hand its id to the second."""
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    home = [
+        {"title": "Mix", "contents": [_home_song("vid00000002", "Slop", "Sloppy Bot", _BLOCKED_ID)]},
+        {"title": "Mix", "contents": [_home_song("vid00000001", "Good")]},
+    ]
+    _home_provider(provider, home)
+
+    rows = asyncio.run(provider.get_recommendations())
+
+    assert [row.item_id for row in rows] == ["ytm_rec_mix_2"]
+
+
+def test_non_ascii_title_slug():
+    assert ytm._home_row_ids(["F\u00fcr dich", "\U0001f525\U0001f525"]) == [
+        "ytm_rec_f\u00fcr_dich",
+        "ytm_rec_row",
+    ]
+
+
+# Item shapes ----------------------------------------------------------------
+
+
+def test_home_playlist_without_browse_id_is_kept(provider):
+    item = provider._parse_home_item(_HOME_FEED[1]["contents"][0])
+
+    assert isinstance(item, ytm.Playlist)
+    assert item.item_id == "RDCLAK5uy_m0wlRoNn5iCTTgBedfoOQ19Jq9P3XTLIA"
+    assert item.name == "Feel-Good Pop & Rock"
+
+
+@pytest.mark.parametrize("playlist_id", ["RDTMAK5uy_abcdef", "RDAMVMjc4A-1KJAZU"])
+def test_home_mix_is_kept(provider, playlist_id):
+    item = provider._parse_home_item(_home_mix(playlist_id))
+
+    assert isinstance(item, ytm.Playlist)
+    assert item.item_id == playlist_id
+
+
+def test_home_song_with_playlist_id_stays_a_track(provider):
+    item = provider._parse_home_item(_home_song())
+
+    assert isinstance(item, ytm.Track)
+    assert item.item_id == "vid00000001"
+
+
+@pytest.mark.parametrize(
+    ("type_text", "expected"),
+    [
+        ("Album", AlbumType.ALBUM),
+        ("Single", AlbumType.SINGLE),
+        ("EP", AlbumType.EP),
+        (None, AlbumType.UNKNOWN),
+        ("Peter Maffay", AlbumType.UNKNOWN),
+    ],
+)
+def test_home_album_is_kept_whatever_its_type_text(provider, type_text, expected):
+    """1.2.1 compared the display text against lowercase values and kept none."""
+    content = _home_album(artist="Peter Maffay", artist_id="UC2fL1mkImUx_l_YELcZjoJw")
+    content["type"] = type_text
+
+    item = provider._parse_home_item(content)
+
+    assert isinstance(item, ytm.Album)
+    assert item.item_id == "MPREb_bot"
+    assert item.album_type == expected
+
+
+def test_home_artist_card_is_an_artist_named_by_title(provider):
+    item = provider._parse_home_item(_home_artist_card("UCrealartist000000000000", "Real Band"))
+
+    assert isinstance(item, ytm.Artist)
+    assert item.item_id == "UCrealartist000000000000"
+    assert item.name == "Real Band"
+
+
+def test_home_podcast_is_kept(provider):
+    content = {
+        "title": "Some Show",
+        "channel": {"name": "Host", "id": "UChost"},
+        "browseId": "MPSPPLx",
+        "podcastId": "PLx",
+        "thumbnails": _home_thumbs("show"),
+    }
+
+    item = provider._parse_home_item(content)
+
+    assert isinstance(item, ytm.Podcast)
+    assert item.item_id == "PLx"
+
+
+def test_home_podcast_episode_is_skipped(provider):
+    content = {
+        "title": "Episode 1",
+        "videoId": "ep00000001",
+        "videoType": ytm.VIDEO_TYPE_PODCAST_EPISODE,
+        "browseId": "MPEDep",
+        "thumbnails": _home_thumbs("episode"),
+    }
+
+    assert provider._parse_home_item(content) is None
+
+
+def test_description_shelf_does_not_sink_the_feed(provider):
+    """1.2.1 raised AttributeError on a string "contents" and lost every row."""
+    home = [
+        {"title": "About this mix", "contents": "A few words about the shelf."},
+        {"title": "Quick picks", "contents": [_home_song()]},
+    ]
+    _home_provider(provider, home)
+
+    rows = asyncio.run(provider.recommendations())
+
+    assert [row.name for row in rows] == ["Quick picks"]
+
+
+def test_missing_thumbnails_do_not_drop_an_item(provider):
+    """ytmusicapi 1.12.2 and later can send thumbnails as None."""
+    content = _home_album(artist="Peter Maffay", artist_id="UC2fL1mkImUx_l_YELcZjoJw")
+    content["thumbnails"] = None
+
+    item = provider._parse_home_item(content)
+
+    assert isinstance(item, ytm.Album)
+
+
+def test_unknown_shape_is_skipped(provider):
+    assert provider._parse_home_item({"title": "Something new", "browseId": "FEmusic_x"}) is None
+    assert provider._parse_home_item("not a dict") is None
+
+
+def test_captured_feed_keeps_every_row(provider):
+    """1.2.1 kept only the song row of this payload."""
+    _home_provider(provider)
+
+    rows = asyncio.run(provider.recommendations())
+
+    assert len(rows) == len(_HOME_FEED) == 7
+    assert sum(len(row.items) for row in rows) == sum(len(s["contents"]) for s in _HOME_FEED)
+
+
+# Images ---------------------------------------------------------------------
+
+
+def test_home_cards_carry_a_thumb(provider):
+    _home_provider(provider)
+
+    for row in asyncio.run(provider.recommendations()):
+        for item in row.items:
+            thumbs = [img for img in item.metadata.images if img.type == ImageType.THUMB]
+            assert thumbs, f"{item.name} has no THUMB"
+    album = provider._parse_home_item(_HOME_FEED[3]["contents"][0])
+    assert any(img.path.endswith("=w600-h600-p") for img in album.metadata.images)
+
+
+def test_frame_only_playlist_cover_is_kept_for_cards(provider):
+    """A card gets no collage, so a video frame beats no artwork."""
+    content = {
+        "title": "Uploads",
+        "playlistId": "PLframes",
+        "thumbnails": [{"url": "https://i.ytimg.com/vi/abc/hqdefault.jpg", "width": 480, "height": 360}],
+    }
+
+    card = provider._parse_home_item(content)
+
+    assert [img.type for img in card.metadata.images] == [ImageType.THUMB]
+    assert provider._parse_playlist(content).metadata.images == []
+
+
+# AI filter ------------------------------------------------------------------
+
+
+def _filtered_home_provider(provider, contents, *, title="For you"):
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset()
+    provider._ai_blocked_channel_ids = frozenset()
+    _home_provider(provider, [{"title": title, "contents": contents}])
+
+
+def test_new_hooks_apply_the_ai_filter(provider):
+    _filtered_home_provider(
+        provider, [_home_song(), _home_song("vid00000002", "Slop", "Sloppy Bot", _BLOCKED_ID)]
+    )
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+
+    assert [t.name for t in _row_items(provider, "ytm_rec_for_you")] == ["Good"]
+
+
+def test_rows_listing_omits_a_row_emptied_by_the_filter(provider):
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    home = [
+        {"title": "All slop", "contents": [_home_song("vid00000002", "Slop", "Sloppy Bot", _BLOCKED_ID)]},
+        {"title": "Quick picks", "contents": [_home_song()]},
+    ]
+    _home_provider(provider, home)
+
+    rows = asyncio.run(provider.get_recommendations())
+
+    assert [row.name for row in rows] == ["Quick picks"]
+    assert list(_row_items(provider, "ytm_rec_all_slop")) == []
+
+
+def test_an_album_by_a_blocked_artist_is_dropped_from_a_home_row(provider):
+    _filtered_home_provider(
+        provider,
+        [
+            _home_album(),
+            _home_album("MPREb_real", "Peter Maffay", "UC2fL1mkImUx_l_YELcZjoJw"),
+        ],
+    )
+    provider._ai_blocked_channel_ids = frozenset({_BLOCKED_ID})
+
+    assert [a.item_id for a in _row_items(provider, "ytm_rec_for_you")] == ["MPREb_real"]
+
+
+def test_an_album_matches_a_blocked_name_too(provider):
+    # The control album proves the row was found and parsed, so an empty
+    # result cannot pass for the right reason by accident.
+    _filtered_home_provider(
+        provider,
+        [
+            _home_album(artist_id="UCsomeotherid00000000000"),
+            _home_album("MPREb_real", "Peter Maffay", "UC2fL1mkImUx_l_YELcZjoJw"),
+        ],
+    )
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+
+    assert [a.item_id for a in _row_items(provider, "ytm_rec_for_you")] == ["MPREb_real"]
+
+
+def test_a_playlist_by_a_blocked_author_id_is_dropped(provider):
+    _filtered_home_provider(
+        provider,
+        [
+            _home_community_playlist(author="Innocent Name"),
+            _home_community_playlist("PLreal", "Real Curator", "UC000000000000000000000b"),
+        ],
+    )
+    provider._ai_blocked_channel_ids = frozenset({_BLOCKED_ID})
+
+    assert [p.item_id for p in _row_items(provider, "ytm_rec_for_you")] == ["PLreal"]
+
+
+def test_a_playlist_by_a_blocked_author_name_is_dropped(provider):
+    _filtered_home_provider(
+        provider,
+        [
+            _home_community_playlist(author="  SLOPPY  bot ", author_id=None),
+            _home_community_playlist("PLreal", "Real Curator", None),
+        ],
+    )
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+
+    assert [p.item_id for p in _row_items(provider, "ytm_rec_for_you")] == ["PLreal"]
+
+
+def test_an_authorless_mix_is_kept(provider):
+    """Editorial lists, mixes and radio have no author, so nothing to blame.
+
+    The Playlist model falls back to the provider's own name as the owner;
+    blocking that name must still not touch them.
+    """
+    _filtered_home_provider(
+        provider, [_home_mix(), _home_mix("RDCLAK5uy_editorial", "Feel-Good Pop & Rock")]
+    )
+    provider._ai_blocked_names = frozenset(
+        {"sloppy bot", ytm._normalize_artist_name(provider.name), "my supermix"}
+    )
+
+    assert len(_row_items(provider, "ytm_rec_for_you")) == 2
+
+
+def test_a_blocked_artist_card_is_dropped(provider):
+    _filtered_home_provider(
+        provider,
+        [_home_artist_card(), _home_artist_card("UCrealartist000000000000", "Real Band")],
+    )
+    provider._ai_blocked_channel_ids = frozenset({_BLOCKED_ID})
+
+    assert [a.item_id for a in _row_items(provider, "ytm_rec_for_you")] == [
+        "UCrealartist000000000000"
+    ]
+
+
+def test_an_artist_card_matches_a_blocked_name_too(provider):
+    _filtered_home_provider(
+        provider,
+        [
+            _home_artist_card("UCsomeotherid00000000000"),
+            _home_artist_card("UCrealartist000000000000", "Real Band"),
+        ],
+    )
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+
+    assert [a.item_id for a in _row_items(provider, "ytm_rec_for_you")] == [
+        "UCrealartist000000000000"
+    ]
+
+
+def test_a_row_emptied_only_by_non_track_drops_is_omitted(provider):
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_channel_ids = frozenset({_BLOCKED_ID})
+    home = [
+        {
+            "title": "Slop shelf",
+            "contents": [_home_album(), _home_community_playlist(), _home_artist_card()],
+        },
+        {"title": "Quick picks", "contents": [_home_song()]},
+    ]
+    _home_provider(provider, home)
+
+    assert [row.name for row in asyncio.run(provider.get_recommendations())] == ["Quick picks"]
+    assert [row.name for row in asyncio.run(provider.recommendations())] == ["Quick picks"]
+
+
+def test_the_filter_off_keeps_every_home_item(provider):
+    contents = [
+        _home_song("vid00000002", "Slop", "Sloppy Bot", _BLOCKED_ID),
+        _home_album(),
+        _home_community_playlist(),
+        _home_artist_card(),
+    ]
+    _filtered_home_provider(provider, contents)
+    provider._ai_filter_enabled = False
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    provider._ai_blocked_channel_ids = frozenset({_BLOCKED_ID})
+
+    assert len(_row_items(provider, "ytm_rec_for_you")) == 4
+
+
+def test_the_home_feed_logs_one_filter_line_per_row(provider):
+    _filtered_home_provider(
+        provider, [_home_song("vid00000002", "Slop", "Sloppy Bot", _BLOCKED_ID), _home_album(), _home_song()]
+    )
+    provider._ai_blocked_channel_ids = frozenset({_BLOCKED_ID})
+    handler = _attach_capture(provider)
+
+    asyncio.run(provider.get_recommendations())
+
+    lines = [m for m in handler.messages() if m.startswith("AI filter removed")]
+    assert lines == ["AI filter removed 2 of 3 items from home feed 'For you'"]
+
+
+def test_a_full_210_page_load_logs_each_row_once_per_call(provider):
+    """One rows call plus one items call per row, as the 2.10 frontend does.
+
+    An items call parses only its own row. Before that, every items call
+    parsed the whole feed and repeated every row's filter and skip lines, so
+    seven rows logged each line eight times per page view.
+    """
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset()
+    provider._ai_blocked_channel_ids = frozenset({_BLOCKED_ID})
+    mystery = {"title": "Mystery", "thumbnails": []}
+    home = [
+        {"title": f"Row {i}", "contents": [_home_song(), _home_album(), mystery]}
+        for i in range(3)
+    ]
+    _home_provider(provider, home)
+    handler = _attach_capture(provider)
+
+    rows = asyncio.run(provider.get_recommendations())
+    assert len(rows) == 3
+    for row in rows:
+        _row_items(provider, row.item_id)
+
+    filter_lines = [m for m in handler.messages() if m.startswith("AI filter removed")]
+    skip_lines = [m for m in handler.messages() if "of unknown shape" in m]
+    for i in range(3):
+        # Once from the rows call, once from that row's own items call.
+        assert filter_lines.count(f"AI filter removed 1 of 2 items from home feed 'Row {i}'") == 2
+    assert len(filter_lines) == 6
+    assert len(skip_lines) == 6
+
+
+def test_track_only_callers_behave_as_before(provider):
+    """Radio keeps its exact semantics now that the helper is shared."""
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    provider._ai_blocked_channel_ids = frozenset({"UC000000000000000000000c"})
+    mock = MagicMock()
+    mock.get_watch_playlist.return_value = {
+        "tracks": [
+            {"videoId": "vid00000001", "title": "Good", "artists": [{"name": "Real Band", "id": "UC000000000000000000000b"}]},
+            {"videoId": "vid00000002", "title": "Slop", "artists": [{"name": "Sloppy Bot", "id": "UC000000000000000000000a"}]},
+            {"videoId": "vid00000003", "title": "By id", "artists": [{"name": "Innocent", "id": "UC000000000000000000000c"}]},
+            {"videoId": "vid00000004", "title": "Feat", "artists": [{"name": "Real Band", "id": "UC000000000000000000000b"}, {"name": "SLOPPY BOT", "id": "UC000000000000000000000d"}]},
+        ]
+    }
+    provider._ytmusic = mock
+    handler = _attach_capture(provider)
+
+    tracks = asyncio.run(provider.get_similar_tracks("vid00000001"))
+
+    assert [t.name for t in tracks] == ["Good"]
+    assert [m for m in handler.messages() if m.startswith("AI filter removed")] == [
+        "AI filter removed 3 of 4 items from song radio for vid00000001"
+    ]
+    bare = _blocklist_track()
+    bare.artists = []
+    assert provider._drop_ai_tracks([bare], "test") == [bare]
+
+
+def test_ai_filter_scope_stays_out_of_artist_pages(provider):
+    """Artist pages are a deliberate lookup, same as search."""
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_channel_ids = frozenset({_BLOCKED_ID})
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    mock = MagicMock()
+    mock.get_artist.return_value = {
+        "name": "Sloppy Bot",
+        "channelId": _BLOCKED_ID,
+        "albums": {"results": [_home_album()], "browseId": None},
+        "singles": {"results": []},
+    }
+    mock.get_artist_albums.return_value = []
+    provider._ytmusic = mock
+
+    albums = asyncio.run(provider.get_artist_albums(_BLOCKED_ID))
+
+    assert [a.item_id for a in albums] == ["MPREb_bot"]

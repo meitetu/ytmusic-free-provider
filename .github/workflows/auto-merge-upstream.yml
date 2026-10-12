@@ -13,7 +13,9 @@ jobs:
     if: >-
       github.repository == 'meitetu/ytmusic-free-provider' &&
       vars.UPSTREAM_AUTO_MERGE == 'true' &&
-      github.event.workflow_run.event == 'pull_request' &&
+      (github.event.workflow_run.event == 'pull_request' ||
+       github.event.workflow_run.event == 'workflow_dispatch' ||
+       github.event.workflow_run.event == 'push') &&
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 5

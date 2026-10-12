@@ -4,6 +4,9 @@ on:
   schedule:
     - cron: "17 20 * * *" # Daily 05:17 JST
   workflow_dispatch:
+  # Also prepare a PR for a manually resolved sync branch pushed by a maintainer.
+  push:
+    branches: ["sync/upstream-*"]
 
 permissions:
   contents: read
@@ -14,13 +17,18 @@ concurrency:
 
 jobs:
   sync:
-    # Enable explicitly in the fork; never create PRs against the upstream repo.
-    if: github.repository == 'meitetu/ytmusic-free-provider' && vars.ENABLE_UPSTREAM_SYNC == 'true'
+    # Enabled in this fork; an explicit false pauses synchronization.
+    if: github.repository == 'meitetu/ytmusic-free-provider' && vars.ENABLE_UPSTREAM_SYNC != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write # dispatch CI for PRs created with GITHUB_TOKEN
     steps:
       - uses: actions/create-github-app-token@v2
         id: app
+        if: vars.SYNC_APP_ID != ''
         with:
           app-id: ${{ vars.SYNC_APP_ID }}
           private-key: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
@@ -33,12 +41,12 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
-          token: ${{ steps.app.outputs.token }}
+          token: ${{ steps.app.outputs.token || github.token }}
 
       - name: Fetch upstream and prepare PR branch
         id: prepare
         env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -57,7 +65,7 @@ jobs:
             count=$(gh pr list --repo "$GITHUB_REPOSITORY" --state all --head "$branch" --json number --jq length)
             if [ "$count" != 0 ]; then
               echo "Already prepared $branch; review the existing PR."
-              echo 'status=existing' >> "$GITHUB_OUTPUT"
+              printf 'status=existing\nbranch=%s\n' "$branch" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             # Recover a previous successful push followed by failed PR creation.
@@ -77,7 +85,7 @@ jobs:
       - name: Push only to the fork and open a PR
         if: steps.prepare.outputs.status == 'merged' || steps.prepare.outputs.status == 'conflict'
         env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
           SYNC_BRANCH: ${{ steps.prepare.outputs.branch }}
           SYNC_STATUS: ${{ steps.prepare.outputs.status }}
           UPSTREAM_SHA: ${{ steps.prepare.outputs.upstream }}
@@ -92,6 +100,34 @@ jobs:
           } > /tmp/upstream-pr-body.md
           args=()
           if [ "$SYNC_STATUS" = conflict ]; then args+=(--draft); fi
-          gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$SYNC_BRANCH" \
-            --title "Sync upstream ${UPSTREAM_SHA:0:12}" --body-file /tmp/upstream-pr-body.md "${args[@]}"
+          if ! gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$SYNC_BRANCH" \
+            --title "Sync upstream ${UPSTREAM_SHA:0:12}" --body-file /tmp/upstream-pr-body.md "${args[@]}"; then
+            echo "::error::PR creation failed. Check Settings > Actions > General > Allow GitHub Actions to create and approve pull requests, or configure the optional sync GitHub App. The prepared branch remains in this fork."
+            exit 1
+          fi
+
+      # GITHUB_TOKEN-created PRs do not trigger pull_request CI. A dispatch is
+      # one of GitHub's supported exceptions and tests this same fork branch.
+      - name: Ensure CI runs for a standard-token PR
+        if: >-
+          steps.app.outputs.token == '' &&
+          (steps.prepare.outputs.status == 'merged' || steps.prepare.outputs.status == 'existing')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SYNC_BRANCH: ${{ steps.prepare.outputs.branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh pr list --repo "$GITHUB_REPOSITORY" --state open --base main \
+            --head "$SYNC_BRANCH" --json headRefOid,isDraft,isCrossRepository > /tmp/sync-pr.json
+          sha=$(jq -r '[.[] | select(.isDraft == false and .isCrossRepository == false)] | if length == 1 then .[0].headRefOid else empty end' /tmp/sync-pr.json)
+          [ -n "$sha" ] || exit 0
+          gh run list --repo "$GITHUB_REPOSITORY" --workflow test.yml \
+            --branch "$SYNC_BRANCH" --limit 50 \
+            --json headSha,status,conclusion,event > /tmp/sync-ci.json
+          if jq -e --arg sha "$sha" 'any(.[]; .headSha == $sha and (.event == "push" or .event == "pull_request" or .event == "workflow_dispatch") and (.status == "queued" or .status == "in_progress" or .conclusion == "success"))' /tmp/sync-ci.json >/dev/null; then
+            echo "CI is already running or passed for $sha."
+            exit 0
+          fi
+          gh workflow run test.yml --repo "$GITHUB_REPOSITORY" --ref "$SYNC_BRANCH"
 

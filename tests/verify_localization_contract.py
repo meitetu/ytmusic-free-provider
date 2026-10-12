@@ -6,6 +6,8 @@ from types import SimpleNamespace
 from music_assistant.controllers.cache import BYPASS_CACHE
 from music_assistant.providers.ytmusic_free import (
     CONF_METADATA_LANGUAGE,
+    HOME_FEED_ROW_LIMIT,
+    YoutubeMusicFreeProvider,
     _build_config_entries,
     use_metadata_cache,
 )
@@ -37,6 +39,19 @@ class Probe:
     async def metadata(self, item_id: str) -> dict[str, str]:
         self.calls += 1
         return {"name": "日本語" if self._metadata_locale == "ja-JP" else "English"}
+
+
+class HomeProbe(Probe):
+    """Exercise the provider's actual home-feed method with MA's real cache."""
+
+    _get_home_feed = YoutubeMusicFreeProvider._get_home_feed
+    account = "brand:0"
+
+    def get_home(self, *, limit):
+        assert limit == HOME_FEED_ROW_LIMIT
+        self.calls += 1
+        return [{"title": "おすすめ" if self._metadata_locale == "ja-JP" else "Recommended",
+                 "account": self.account}]
 
 
 async def main():
@@ -78,6 +93,29 @@ async def main():
     finally:
         BYPASS_CACHE.reset(token)
     await asyncio.gather(*tasks)
+    home = HomeProbe()
+    home.instance_id = "home-locale-probe"
+    home.mass = probe.mass
+    home._ytmusic = SimpleNamespace(get_home=home.get_home)
+    cache.entries[(home.instance_id, "_get_home_feed.brand:0", str(HOME_FEED_ROW_LIMIT))] = [
+        {"title": "old English"}
+    ]
+    assert (await home._get_home_feed(home.account))[0]["title"] == "おすすめ"
+    await asyncio.gather(*tasks)
+    assert (await home._get_home_feed(home.account))[0]["title"] == "おすすめ"
+    assert home.calls == 1
+    home._metadata_locale = "en-US"
+    assert (await home._get_home_feed(home.account))[0]["title"] == "Recommended"
+    await asyncio.gather(*tasks)
+    assert home.calls == 2, "home-feed locale changes must not reuse Japanese shelves"
+    home._metadata_locale = "ja-JP"
+    assert (await home._get_home_feed(home.account))[0]["title"] == "おすすめ"
+    assert home.calls == 2, "returning to a cached locale should reuse its own feed"
+    home.account = "brand:1"
+    assert (await home._get_home_feed(home.account))[0]["account"] == "brand:1"
+    await asyncio.gather(*tasks)
+    assert home.calls == 3, "switching account must still fetch a separate home feed"
+    print("real provider home-feed locale/account cache contract ok")
     print("real server localization cache and playback-bypass contract ok")
 
 

@@ -26,13 +26,15 @@ whole premise is that the server package is stubbed out.
 from __future__ import annotations
 
 import inspect
+import re
 
 # Parameters of ``music_assistant.controllers.cache.use_cache`` that the provider
-# passes. It decorates eleven methods, every one of them as
-# ``@use_cache(<int>, allow_expired_cache=True)``, and the three long-lived
-# lookups that return tracks also pass ``cache_checksum`` so a parser change can
-# retire their 30-day entries (issue #90). Losing any of these names is a
-# TypeError raised while the class body executes.
+# passes. It decorates twelve methods, every one of them as
+# ``@use_cache(<int>, allow_expired_cache=True)``. Four also pass
+# ``cache_checksum``: the three long-lived lookups that return tracks, so a
+# parser change can retire their 30-day entries (issue #90), and the home feed,
+# so a change of its row limit retires the shorter feed (issue #96). Losing any
+# of these names is a TypeError raised while the class body executes.
 REQUIRED_USE_CACHE_PARAMS = ("expiration", "allow_expired_cache", "cache_checksum")
 
 # Not passed by the provider, and that is exactly why it needs asserting here.
@@ -43,6 +45,26 @@ REQUIRED_USE_CACHE_PARAMS = ("expiration", "allow_expired_cache", "cache_checksu
 # dynamic playlists would quietly freeze for three hours at a time, which is
 # issue #56 reopened, and every other check here would stay green.
 REQUIRED_BYPASS_NAMES = ("allow_bypass",)
+
+# Server hooks the provider must override, with sample positional arguments to
+# bind against both signatures. Music Assistant 2.10 replaced recommendations()
+# with these two and left no shim: their base versions raise NotImplementedError
+# once RECOMMENDATIONS is declared, so a provider that misses them imports and
+# loads fine and simply shows no rows (issue #96). An import cannot catch that,
+# hence the explicit check, plus the generic sweep in check_provider_hooks for
+# the next hook upstream gates the same way.
+REQUIRED_PROVIDER_HOOKS = {
+    "get_recommendations": (),
+    "get_recommendation_items": ("row_id",),
+}
+
+# The base-class pattern that turns a declared feature into a hard failure:
+# ``if ProviderFeature.X in self.supported_features: raise NotImplementedError``.
+# Only the positive form. ``browse`` uses ``not in`` and falls back instead.
+_FEATURE_GATE = re.compile(
+    r"if\s+ProviderFeature\.(\w+)\s+in\s+self\.supported_features\s*:\s*"
+    r"raise\s+NotImplementedError"
+)
 
 
 def main() -> None:
@@ -75,8 +97,56 @@ def main() -> None:
     print(f"use_cache signature ok: {', '.join(params)}")
     print(f"BYPASS_CACHE ok: {BYPASS_CACHE!r}")
 
+    check_provider_hooks(provider)
     check_auth_notice_contract()
     print("server contract ok")
+
+
+def check_provider_hooks(provider) -> None:
+    """Fail when a feature we declare lands on a base hook that raises (issue #96).
+
+    Every hook is looked up through the MRO, never by reading
+    music_provider.py: on 2.11 the recommendation hooks live in a mixin, and
+    there ``MusicProvider.browse`` shadows a mixin ``browse`` whose source
+    carries a positive gate that never runs.
+    """
+    from music_assistant.models.music_provider import MusicProvider
+
+    ours = provider.YoutubeMusicFreeProvider
+    for name, args in REQUIRED_PROVIDER_HOOKS.items():
+        base = getattr(MusicProvider, name, None)
+        if base is None:
+            raise SystemExit(
+                f"MusicProvider has no {name}() any more; upstream renamed the "
+                "recommendation hooks again. See issue #96."
+            )
+        mine = getattr(ours, name)
+        if mine is base:
+            raise SystemExit(f"the provider does not override {name}(); see issue #96.")
+        for label, fn in (("base", base), ("provider", mine)):
+            try:
+                inspect.signature(fn).bind(None, *args)
+            except TypeError as err:
+                raise SystemExit(f"{label} {name}() no longer takes {args}: {err}") from err
+
+    declared = {
+        feature.name for feature in provider.BASE_FEATURES | provider.AUTHENTICATED_FEATURES
+    }
+    unhandled = []
+    for name, fn in inspect.getmembers(MusicProvider, inspect.iscoroutinefunction):
+        try:
+            source = inspect.getsource(fn)
+        except (OSError, TypeError):
+            continue
+        for feature in _FEATURE_GATE.findall(source):
+            if feature in declared and getattr(ours, name) is fn:
+                unhandled.append(f"{name}() (ProviderFeature.{feature})")
+    if unhandled:
+        raise SystemExit(
+            "the provider declares features whose base hooks raise NotImplementedError "
+            f"and does not override them: {', '.join(sorted(unhandled))}. See issue #96."
+        )
+    print(f"provider hooks ok: {', '.join(REQUIRED_PROVIDER_HOOKS)}")
 
 
 def check_auth_notice_contract() -> None:

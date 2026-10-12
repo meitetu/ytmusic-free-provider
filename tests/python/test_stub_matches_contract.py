@@ -22,6 +22,7 @@ features the provider really declares. See issue #65.
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import re
 import sys
 from pathlib import Path
@@ -40,7 +41,9 @@ from music_assistant_models.media_items import (
     ItemMapping,
     Podcast,
     PodcastEpisode,
+    RecommendationFolder,
 )
+from music_assistant.models.music_provider import MusicProvider
 from music_assistant_models.streamdetails import StreamDetails
 
 # Resolves because conftest.py registers the stubs and puts the project root on
@@ -52,6 +55,7 @@ if str(TESTS_ROOT) not in sys.path:
     sys.path.insert(0, str(TESTS_ROOT))
 
 import ma_contract  # noqa: E402
+import verify_server_contract  # noqa: E402
 
 # Every literal ``ProviderFeature.MEMBER`` in the provider source. Used only to
 # find references the two feature sets do not account for, never to build the
@@ -203,6 +207,37 @@ def test_stub_item_mapping_has_the_required_fields():
     fields = {f.name for f in dataclasses.fields(ItemMapping)}
     missing = set(ma_contract.REQUIRED_ITEM_MAPPING_FIELDS) - fields
     assert not missing, f"stub ItemMapping is missing {missing}"
+
+
+def test_stub_recommendation_folder_has_the_required_fields():
+    """Exactly the four, so a 2.10-only keyword raises TypeError in this suite.
+
+    That keeps the provider loadable on Music Assistant 2.9, whose models
+    reject the keywords 2.10 added (type, enabled_by_default,
+    supports_provider_filter). Issue #96.
+    """
+    fields = {f.name for f in dataclasses.fields(RecommendationFolder)}
+    assert fields == set(ma_contract.REQUIRED_RECOMMENDATION_FOLDER_FIELDS), (
+        f"stub RecommendationFolder has {sorted(fields)}; keep it at the four fields "
+        "the provider passes, since 2.10-only keywords fail on Music Assistant 2.9"
+    )
+
+
+@pytest.mark.parametrize(
+    ("hook", "args"), sorted(verify_server_contract.REQUIRED_PROVIDER_HOOKS.items())
+)
+def test_provider_hooks_match_the_server_contract_table(hook, args):
+    """The hooks the server check requires are overridden here and still bind.
+
+    ``tests/verify_server_contract.py`` checks the same table against the real
+    server image; this is the half that runs on every push. Issue #96.
+    """
+    base = getattr(MusicProvider, hook, None)
+    ours = getattr(ytm.YoutubeMusicFreeProvider, hook, None)
+    assert base is not None, f"the stub MusicProvider lacks {hook}(); mirror the server base"
+    assert ours is not None and ours is not base, f"the provider does not override {hook}()"
+    inspect.signature(base).bind(None, *args)
+    inspect.signature(ours).bind(None, *args)
 
 
 def test_stub_podcast_has_the_required_fields():

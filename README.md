@@ -61,6 +61,32 @@ Home Assistant のアドオンストアで再読み込みし、ローカルア�
 Supervisor による MA コンテナの再作成後にも、Watcher がコピーを復旧します。
 これは仕組みの説明であり、HAOS 実機での復旧確認を意味しません。
 
+#### v1.2.2 からの更新
+
+Fork の `v1.2.3` は、本家の MA 2.10 おすすめ表示対応とホームフィード取得改善を
+取り込み、おすすめのキャッシュも言語・アカウント別に分離します。Cookie の再入力や
+プロバイダーの削除・追加は不要です。MA の再起動中は再生が止まります。
+
+Watcher を固定タグで導入した場合は、先に Watcher を停止し、両方の取得元を同じタグに
+揃えてください。Advanced SSH & Web Terminal で単体インストーラを実行する例:
+
+```sh
+curl -fL --proto '=https' --tlsv1.2 \
+  https://raw.githubusercontent.com/meitetu/ytmusic-free-provider/v1.2.3/scripts/install_provider.sh \
+  -o /tmp/install_provider.sh
+sh /tmp/install_provider.sh --repo-owner meitetu --ref v1.2.3 \
+  --ma-id app_d5369777_music_assistant --force
+```
+
+`--ma-id` はこの Fork の利用環境で確認した名前です。他の環境では `docker ps` の
+Music Assistant コンテナ名に置き換えてください。Watcher も `v1.2.3` の
+`install_watcher_addon.sh` を保存し、同じ `--repo-owner`、`--ref`、`--ma-id` で
+再生成します。Home Assistant の **設定 → アプリ** でローカルアプリを再読み込みし、
+Provider Watcher を再ビルドまたは再インストールしてから起動してください。
+インストーラ再実行だけでは、インストール済み Watcher のイメージは更新されません。
+正常動作を確認するまでは `auto_update: false` を維持します。問題が出た場合は同じ
+手順の両方のタグを `v1.2.2` に戻します。
+
 `--release-only` は安定リリースの取得失敗時に停止します。本家の既定動作である
 未検証の `main` へのフォールバックを使いません。`--ref` とは併用できません。
 Watcher の `auto_update` は既定で **false** です。本番の更新は、リリースと CI
@@ -115,23 +141,36 @@ Cookie を GitHub の Secret、Issue、PR、ログに貼らないでください
 有効化に必要な Fork の GitHub 設定:
 
 - Fork で Actions と scheduled workflows を有効化し、既定ブランチを `main` にする。
-- この Fork だけにインストールした GitHub App を用意する。Repository permissions は
-  **Contents: write、Pull requests: write、Workflows: write**（本家の workflow 更新も
-  ブランチに push するため）、Metadata は既定の read のみ。HA の資格情報は不要。
-- Actions Variables に `SYNC_APP_ID` と `ENABLE_UPSTREAM_SYNC=true`、Actions Secret に
-  `SYNC_APP_PRIVATE_KEY` を登録する。秘密鍵は GitHub の安全な設定欄だけに入力する。
-  App の短命トークンはこのリポジトリだけに限定され、ジョブ終了時に失効する。
+- **Settings → Actions → General → Workflow permissions** の
+  **Allow GitHub Actions to create and approve pull requests** を有効にする。
+  標準の `GITHUB_TOKEN` で動き、App や個人トークンの登録は不要。
+  同期ジョブだけに Contents / Pull requests / Actions の write 権限を付ける。
+  CI の権限は Contents: read のまま。
+- 毎日の同期はこの Fork で既定で有効。止める場合は Actions Variable
+  `ENABLE_UPSTREAM_SYNC=false` を登録する。未設定または `true` なら動く。
+- GitHub App を利用する場合は、Actions Variable `SYNC_APP_ID` と Secret
+  `SYNC_APP_PRIVATE_KEY` を登録する。この Fork だけにインストールし、権限は
+  **Contents: write、Pull requests: write、Workflows: write**、Metadata は既定の read。
+  秘密鍵は GitHub の Secret 設定欄だけに入力する。App を設定した場合は App を使い、
+  認証失敗を標準トークンで迂回しない。HA の資格情報はどちらの方式でも不要。
 - `main` のブランチ保護で PR、最新 base に対するステータスチェック **required** を
   必須にし、管理者・App を含む bypass と force push を許可しない。sync PR の
   ソース変更・workflow 変更もレビューする。
 - 自動マージを希望する場合のみリポジトリの Allow auto-merge と
   `UPSTREAM_AUTO_MERGE=true` を有効にする。既定は手動マージ。
 
-通常の `GITHUB_TOKEN` で PR を作ると後続 CI が起動しないため、同期には App を
-使用します。自動マージ用 workflow は `test` の成功と集約ジョブ `required` の
+通常の `GITHUB_TOKEN` で PR を作ると `pull_request` CI は自動起動しないため、
+標準トークンの方式では同期ブランチの `test.yml` を `workflow_dispatch` で明示的に
+起動します。同じ HEAD に成功済み／実行中の CI がある場合は重複実行しません。
+App の方式では通常の PR CI が動きます。手動で解決した `sync/upstream-*` ブランチを
+push した場合も CI と同期 PR 作成が動きます。PR 作成に失敗した場合はジョブが失敗し、
+作成済みブランチは Fork に残るので、設定を直して **Sync upstream → Run workflow**
+を実行すると再開できます。自動マージ用 workflow は `test` と集約ジョブ `required` の
 成功を確認し、同じ Fork・ブランチ・**検証した HEAD SHA** の非 Draft PR にだけ
 マージを要求します。競合レポートのある PR は対象外です。特権のある
 `workflow_run` 内では PR のコードやアーティファクトを実行しません。
+PR の CI、同期ブランチへの push CI、明示的に起動した CI が対象で、いずれも現在の
+PR の HEAD SHA と一致する成功結果だけを使います。自動マージの設定は既定で無効です。
 
 CI は Python 構文・Ruff の致命的エラー／未定義名チェック、既存・日本語化テスト、
 実モデルの契約、stable サーバーイメージへのインポート・言語キャッシュ契約、
@@ -539,8 +578,9 @@ playlist links.)
 - Turn on **Filter AI-generated music** in the provider settings, then give it something to work with. The toggle on its own filters nothing.
 - **Blocked artists** takes one entry per line, or several separated by semicolons. An entry is either an artist name or a YouTube channel id (`UC...`). Semicolons rather than commas on purpose: commas are common inside real artist names, and splitting on them would turn `Earth, Wind & Fire` into a rule that blocks everyone called Earth. Names match loosely, ignoring case and extra spacing; channel ids match exactly and are the better choice when two artists share a name. Lines starting with `#` are ignored.
 - **Blocklist URL** is optional and points at a list somebody else maintains, merged with your own entries. It accepts a JSON array of names or channel ids, a JSON object with an `artists` key, or plain text one entry per line. It refreshes in the background roughly twice a day, and if the URL is unreachable the previous list stays in effect rather than the filter quietly switching itself off.
-- **Scope:** this applies to auto-generated lists only, which is where unrequested music arrives: radio, mixes, similar tracks and the home feed. Search results, your library and playlists you picked yourself are never filtered, so looking up a blocked artist on purpose still finds them.
+- **Scope:** this applies to auto-generated lists only, which is where unrequested music arrives: radio, mixes, similar tracks and the home feed (the recommendation rows). Search results, your library, artist pages and playlists you picked yourself are never filtered, so looking up a blocked artist on purpose still finds them.
 - A track is dropped when any of its artists matches. Tracks whose artist could not be read are always kept, so a parsing gap never silently removes music.
+- The recommendation rows also carry albums, artists and playlists, and since 1.2.2 those are filtered too: an album when any of its artists matches, an artist card when that artist matches, and a playlist when its author matches, by channel id or by name in the same way as tracks (YouTube supplies the author's channel id on most community playlists). Playlists without an author, such as YouTube's own editorial lists and your personal mixes, are always kept. A row left with nothing is hidden. Background: [#96](https://github.com/sproft/ytmusic-free-provider/issues/96).
 - Detection itself is out of scope here: the provider filters against a list, it does not judge whether a track is AI-generated. For a provider-agnostic approach that analyses the queue, see the discussion in [#53](https://github.com/sproft/ytmusic-free-provider/issues/53).
 
 **Playback fails with 403 on some tracks**
@@ -552,6 +592,12 @@ playlist links.)
 - Fixed in 1.2.1. Since early October 2026 YouTube hands out some stream URLs (about one in twelve in our measurements) that serve only the first minute or so of a track and refuse everything after it. The server played what had arrived and then moved on, logging `Track ... aborted by a stream error - skipping`, with an error from this provider that mentions `googlevideo answered 403`.
 - The provider now resolves a fresh URL when that happens and continues from the exact byte where the stream stopped. It first checks that the fresh URL serves the identical file, so playback carries on without a gap or a repeated passage.
 - If a track still stops early, the error ends with `on 5 urls in a row`, meaning five URLs in a row were capped. Please open an issue with that log line.
+
+**No YouTube Music rows on the home or Discover page, or `NotImplementedError` on MA 2.10 and newer**
+- Fixed in 1.2.2. Music Assistant 2.10 changed how a provider hands over its recommendations: it now asks for the list of rows first and then for each row's items separately, and the old single call is gone. Earlier releases of this provider only answered the old call, so on 2.10 and newer no rows appeared, the log showed a warning starting `Error while fetching recommendation rows from YouTube Music (Free)` that ended in an empty message, and opening **Browse → YouTube Music (Free) → recommendations** failed with error 999 (`NotImplementedError`). MA 2.9 keeps working as before.
+- The same release fixes the rows themselves on every server version. Playlists, mixes, albums and podcasts in the home feed were silently dropped, so usually only "Quick picks" came through. They now appear with their artwork.
+- Since 1.2.3 the provider reads about 20 shelves of the home feed, where 1.2.2 read 6. Logged-in accounts get shelves such as "Albums for you", "New releases" and "Mixed for you" well down the page, around the 12th to 14th, so with 6 they were usually missing.
+- Recommendations still need a working cookie. The feed is cached for an hour, so a new row can take that long to appear, and the cache is kept across restarts. Right after installing or updating to 1.2.3, or after changing the brand account or account index, the feed has to be fetched first, which takes a few seconds. On MA 2.10 and newer, if that takes longer than five seconds, the YouTube Music rows are skipped for that page load and appear on the next one. Background: [#96](https://github.com/sproft/ytmusic-free-provider/issues/96).
 
 **Podcasts never sync, and the log says the installed ytmusicapi has no `get_library_podcasts()`**
 - Upgrade ytmusicapi inside the server container with `pip install --upgrade ytmusicapi`, then **restart the server**. The restart is load-bearing: the old module is already imported in the running process, and neither the upgrade nor a provider reload replaces it. You have it right when the `get_library_podcasts failed` warning stops appearing and the podcast sync completes.

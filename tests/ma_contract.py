@@ -129,6 +129,21 @@ REQUIRED_ITEM_MAPPING_FIELDS: tuple[str, ...] = (
     "year",
 )
 
+# ``RecommendationFolder`` fields, and the only keywords the provider may pass
+# when it builds one. Music Assistant 2.9.13 pins models 1.1.129.post1, whose
+# RecommendationFolder raises TypeError on the keywords 2.10 added (type,
+# enabled_by_default, supports_provider_filter), so none of those may be
+# passed. Keeping the list at the four the provider uses makes any new keyword
+# a deliberate decision. Both sides check construction from these four alone
+# still works, so a new required field upstream fails here instead of blanking
+# the rows (issue #96).
+REQUIRED_RECOMMENDATION_FOLDER_FIELDS: tuple[str, ...] = (
+    "item_id",
+    "provider",
+    "name",
+    "items",
+)
+
 # ``Podcast`` fields the provider sets.
 REQUIRED_PODCAST_FIELDS: tuple[str, ...] = (
     "item_id",

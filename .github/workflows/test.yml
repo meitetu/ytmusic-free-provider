@@ -6,7 +6,7 @@ on:
   # everything here is offline or public.
   workflow_call:
   push:
-    branches: [main]
+    branches: [main, "sync/upstream-*"]
   pull_request:
   # Nightly, because several jobs here install upstream unpinned and can only go
   # red once somebody else publishes. models-contract resolves whatever

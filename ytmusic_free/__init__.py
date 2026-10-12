@@ -24,7 +24,7 @@ from __future__ import annotations
 # never reach an install. And Music Assistant would throw it away anyway:
 # ProviderManifest has no version field and mashumaro drops unknown keys, so the
 # manifest object handed to the provider never carries one. See issue #68.
-__version__ = "1.2.2"
+__version__ = "1.2.3"
 
 import asyncio
 import importlib
@@ -237,6 +237,33 @@ TRACK_CACHE_VERSION = "2"
 # window: long enough that paging through a queue is stable, short enough that
 # asking again tomorrow gives you different music.
 SIMILAR_TRACKS_CACHE_TTL = 24 * 3600
+
+# The raw home feed behind the recommendation rows (issue #96). One hour is the
+# figure upstream uses for its own recommendation payloads, and what the
+# official ytmusic provider cached get_home for on 2.9. Music Assistant 2.10
+# asks for the rows and then for each row's items in separate calls, and every
+# one of them reads this one entry, so the whole Discover page costs a single
+# get_home call. The raw payload is cached rather than the parsed rows so the AI
+# filter runs on every read and a blocklist edit applies at once.
+HOME_FEED_CACHE_TTL = 3600
+
+# Passed to get_home as its limit. ytmusicapi treats it as a minimum: it keeps
+# requesting continuation pages until it holds at least this many rows, and
+# never slices the result. The first page carries only a few rows and each
+# continuation request about three more, one sequential request each.
+# Twenty because logged-in feeds put the shelves people look for far down: in
+# the feed shared on issue #96, "Albums for you", "New releases" and "Mixed for
+# you" came 12th to 14th, and the order changes from one fetch to the next, so
+# the six that 1.2.2 asked for never reached them. That feed ran out at 19
+# shelves. The extra requests only show on a cold cache, since a warm entry is
+# refreshed in the background. On Music Assistant 2.10 the rows call runs under
+# a 5 s timeout, and a cold fetch that overruns it skips the rows for that one
+# page load while still filling the cache. The value is also the feed's cache
+# checksum, see _get_home_feed.
+HOME_FEED_ROW_LIMIT = 20
+
+# Row ids are this prefix plus a slug of the row title, see _home_row_ids.
+HOME_ROW_ID_PREFIX = "ytm_rec_"
 
 # Album lookups run to fill in release years on tracks that only carry an album
 # id. Bounded on both axes: at most this many at once, so a cold cache does not
@@ -1028,6 +1055,36 @@ def _stream_encode(url: str | None) -> tuple[str, str, str] | None:
     return encode if all(encode) else None
 
 
+def _home_row_ids(titles: list[str]) -> list[str]:
+    """Stable, unique recommendation row ids for the home feed titles, in order.
+
+    Music Assistant 2.10 lists the rows and fetches each row's items in a
+    separate call, so the id is the only thing tying the two together. The
+    frontend also keys a row's state and the user's saved row order on it.
+
+    No "/" ever appears in an id: 2.10's base browse keeps only the second path
+    segment of a recommendations path, so a slash would cut the id short. A
+    repeated title gets ``_2``, ``_3`` and so on. Ids are assigned over every
+    row in payload order before anything is filtered, so a row the AI filter
+    empties never renumbers the rows after it. Simple titles keep the id they
+    had in 1.2.1 ("Quick picks" is still ``ytm_rec_quick_picks``). Issue #96.
+    """
+    used: set[str] = set()
+    ids: list[str] = []
+    for title in titles:
+        slug = re.sub(r"\W+", "_", title.lower()).strip("_") or "row"
+        row_id = f"{HOME_ROW_ID_PREFIX}{slug}"
+        suffix = 1
+        # A loop rather than a per-slug counter, so "Mix", "Mix" and "Mix 2"
+        # cannot both end up as ytm_rec_mix_2.
+        while row_id in used:
+            suffix += 1
+            row_id = f"{HOME_ROW_ID_PREFIX}{slug}_{suffix}"
+        used.add(row_id)
+        ids.append(row_id)
+    return ids
+
+
 async def setup(
     mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
 ) -> ProviderInstanceType:
@@ -1177,9 +1234,11 @@ def _build_config_entries() -> tuple[ConfigEntry, ...]:
             required=False,
             description="When enabled, tracks by artists on your blocklist are removed "
             "from radio, mixes, similar tracks and recommendations before they reach the "
-            "queue. Search results, your library and playlists you chose yourself are "
-            "never filtered, so looking something up still finds it. Off by default, and "
-            "it does nothing until you give it a list below.",
+            "queue. In recommendations the blocked artists' albums, their own artist "
+            "cards and playlists they made are removed too. Search results, your library "
+            "and playlists you chose yourself are never filtered, so looking something up "
+            "still finds it. Off by default, and it does nothing until you give it a list "
+            "below.",
         ),
         ConfigEntry(
             key=CONF_AI_BLOCKLIST,
@@ -1246,6 +1305,12 @@ class YoutubeMusicFreeProvider(MusicProvider):
     # does not garbage collect it mid-request.
     _ai_blocklist_task: object = None
     _authenticated: bool = False
+    # Cache key for the home feed: "<brand account>:<account index>", set once
+    # cookie auth succeeds. Music Assistant keys cache entries per instance on
+    # the method's arguments, so without it switching the brand account or the
+    # index would keep serving the previous account's feed for up to an hour.
+    # Issue #96.
+    _home_feed_account: str = ""
     _auth_lapse_warned: bool = False
     # The auth notice this instance wants shown in the Music Assistant UI, and
     # the one it last wrote there. None means no notice. See _sync_auth_notice.
@@ -1339,6 +1404,9 @@ class YoutubeMusicFreeProvider(MusicProvider):
                             "an empty library rather than an auth error)"
                         )
                     self._authenticated = True
+                    self._home_feed_account = (
+                        f"{brand_account or ''}:{self._configured_auth_user()}"
+                    )
                     self._auth_lapse_warned = False
                     self.logger.info(
                         "YouTube Music (Free) initialized with cookie authentication — "
@@ -3405,54 +3473,228 @@ class YoutubeMusicFreeProvider(MusicProvider):
             self._warn_library_error(f"library_remove for {prov_item_id}", err)
             return False
 
+    # ------------------------------------------------------------------
+    # Recommendations (home feed)
+    #
+    # Music Assistant 2.9.x and 2.10.0b0 to b7 call only recommendations(),
+    # which returns rows with their items. 2.10.0b8 and later call only
+    # get_recommendations() for the rows and get_recommendation_items() per
+    # row, and their base versions raise NotImplementedError once
+    # RECOMMENDATIONS is declared. No server calls both, so no version check
+    # is needed; same arrangement as get_config_entries. Both hook families
+    # share one parse. Issue #96.
+    # ------------------------------------------------------------------
+
     async def recommendations(self) -> list[RecommendationFolder]:
-        """Get personalized recommendations from YouTube Music home feed."""
-        if not self._authenticated:
+        """Home feed rows with their items, for Music Assistant 2.9.x."""
+        return await self._home_feed_rows()
+
+    async def get_recommendations(self) -> list[RecommendationFolder]:
+        """Home feed rows without their items, for Music Assistant 2.10 and later.
+
+        2.10 wants this call fast and runs it under a 5 s timeout. The rows
+        come from the same cached payload the items do, so once the cache is
+        warm, fresh or stale, nothing here goes to YouTube. A row the AI filter
+        empties is left out, so the listing never shows a shelf that opens
+        empty.
+        """
+        # Only these four keywords. Music Assistant 2.9's models (1.1.129.post1)
+        # raise TypeError on the ones 2.10 added (type, enabled_by_default,
+        # supports_provider_filter), so none of those may be passed.
+        return [
+            RecommendationFolder(
+                item_id=row.item_id, provider=row.provider, name=row.name, items=UniqueList()
+            )
+            for row in await self._home_feed_rows()
+        ]
+
+    async def get_recommendation_items(
+        self, item_id: str
+    ) -> UniqueList[MediaItemType | ItemMapping]:
+        """The items of one home feed row, for Music Assistant 2.10 and later.
+
+        An unknown id answers empty rather than raising. Row titles are
+        personalised, so a payload refreshed between the rows call and this
+        one can legitimately no longer carry the row.
+        """
+        # Only the asked-for row is parsed. 2.10 sends one of these calls per
+        # row on every Discover load, and parsing the whole feed each time
+        # repeated every row's AI filter and skip debug lines once per row.
+        for section, title, row_id in await self._home_feed_sections():
+            if row_id == item_id:
+                row = self._home_feed_row(section, title, row_id)
+                return row.items if row is not None else UniqueList()
+        return UniqueList()
+
+    # The checksum is the row limit the payload was fetched with. Music
+    # Assistant treats an entry with a different checksum as a miss, fresh or
+    # stale, so changing the limit retires the old feed on its next read
+    # instead of serving it until its hour runs out. Entries written by 1.2.2
+    # carry no checksum at all and are retired the same way.
+    @use_metadata_cache(
+        HOME_FEED_CACHE_TTL,
+        allow_expired_cache=True,
+        cache_checksum=str(HOME_FEED_ROW_LIMIT),
+    )
+    async def _get_home_feed(self, account: str) -> list[dict[str, Any]]:  # noqa: ARG002
+        """The raw get_home payload, cached per account and metadata locale.
+
+        ``account`` is unused in the body on purpose: it exists to be part of
+        the cache key. A failure re-raises rather than returning an empty list,
+        because every Music Assistant release caches any result that is not
+        None, an empty list included, and that would blank the rows for an
+        hour after one network hiccup. The 2.10 escape hatch for that
+        (``cache_none``) does not exist on 2.9, where passing it would stop the
+        provider importing.
+        """
+        try:
+            return await asyncio.to_thread(self._ytmusic.get_home, limit=HOME_FEED_ROW_LIMIT)
+        except Exception as err:
+            # Reported here, inside the cached call, so the cookie hint and the
+            # auth notice fire for a background refresh as well as a cold fetch.
+            self._warn_library_error("get_home", err)
+            raise
+
+    async def _home_feed_rows(self) -> list[RecommendationFolder]:
+        """Parse the cached home feed into rows, AI filter applied, empty rows left out.
+
+        Never raises: a raise on the 2.10 browse path reaches the user as error
+        999. The parse runs on the event loop because the AI filter may
+        schedule a blocklist refresh, which needs the running loop; it is a
+        few dozen small dicts.
+        """
+        rows: list[RecommendationFolder] = []
+        for section, title, row_id in await self._home_feed_sections():
+            row = self._home_feed_row(section, title, row_id)
+            if row is not None:
+                rows.append(row)
+        return rows
+
+    async def _home_feed_sections(self) -> list[tuple[dict[str, Any], str, str]]:
+        """The cached home feed's sections with their titles and row ids, unparsed.
+
+        Row ids are assigned over every title before any filtering, so a row
+        keeps its id whether or not the AI filter empties a row before it.
+        Never raises, for the same reason as _home_feed_rows.
+        """
+        if not self._authenticated or self._ytmusic is None:
             return []
         try:
-            home = await asyncio.to_thread(self._ytmusic.get_home, limit=6)
-        except Exception as err:
-            self._warn_library_error("get_home", err)
+            home = await self._get_home_feed(self._home_feed_account)
+        except Exception:  # noqa: BLE001 - already reported inside _get_home_feed
             return []
-        folders: list[RecommendationFolder] = []
-        for section in home:
-            title = section.get("title", "Recommendations")
-            items: list[MediaItemType | ItemMapping] = []
-            for content in section.get("contents", []):
-                if not content:
-                    continue
-                with suppress(InvalidDataError, KeyError, TypeError):
-                    if video_id := content.get("videoId"):
-                        track = self._parse_track(content)
-                        # Filtered per track, so a folder left with nothing is
-                        # dropped by the `if items` check below rather than
-                        # rendering as an empty shelf.
-                        if track and self._drop_ai_tracks([track], f"home feed '{title}'"):
-                            items.append(track)
-                    elif browse_id := content.get("browseId"):
-                        if content.get("subscribers") or content.get("type") == "artist":
-                            items.append(self._get_item_mapping(
-                                MediaType.ARTIST, browse_id, content.get("title", "")
-                            ))
-                        elif content.get("type") in ("album", "single", "ep"):
-                            items.append(self._get_item_mapping(
-                                MediaType.ALBUM, browse_id, content.get("title", "")
-                            ))
-                        elif content.get("playlistId") or "playlist" in content.get("type", ""):
-                            items.append(self._get_item_mapping(
-                                MediaType.PLAYLIST,
-                                content.get("playlistId", browse_id),
-                                content.get("title", ""),
-                            ))
-            if items:
-                folder = RecommendationFolder(
-                    item_id=f"ytm_rec_{title.lower().replace(' ', '_')}",
-                    provider=self.instance_id,
-                    name=title,
-                    items=UniqueList(items),
-                )
-                folders.append(folder)
-        return folders
+        # A description shelf carries its text as a string in "contents"; it
+        # is not a row of items and used to abort the whole parse.
+        sections = [
+            section
+            for section in home or []
+            if isinstance(section, dict) and isinstance(section.get("contents"), list)
+        ]
+        titles = [str(section.get("title") or "Recommendations") for section in sections]
+        return list(zip(sections, titles, _home_row_ids(titles), strict=True))
+
+    def _home_feed_row(
+        self, section: dict[str, Any], title: str, row_id: str
+    ) -> RecommendationFolder | None:
+        """One home feed section as a row, AI filter applied, or None if that empties it."""
+        items: list[Any] = []
+        credited_to: list[list[ItemMapping] | None] = []
+        for content in section["contents"]:
+            item = self._parse_home_item(content)
+            if item is None:
+                continue
+            items.append(item)
+            credited_to.append(
+                self._home_playlist_credits(content) if isinstance(item, Playlist) else None
+            )
+        # One filter call per row, so the debug log says how much of each
+        # shelf went rather than one line per item.
+        items = self._drop_ai_items(items, f"home feed '{title}'", credited_to)
+        if not items:
+            return None
+        return RecommendationFolder(
+            item_id=row_id,
+            provider=self.instance_id,
+            name=title,
+            items=UniqueList(items),
+        )
+
+    def _parse_home_item(
+        self, content: Any
+    ) -> Track | Album | Artist | Playlist | Podcast | None:
+        """Turn one home feed card into a media item, or None to skip it.
+
+        Full items rather than ItemMappings, so the cards carry artwork, album
+        type and artists. Music Assistant fetches a fresh copy before a library
+        add or playback, so the partial data here only ever feeds the card.
+
+        The order matters. Songs carry a playlistId too, so the videoId test
+        comes first. Playlists and mixes carry a playlistId and no browseId,
+        which is why 1.2.1 dropped every one of them: its playlist test sat
+        under the browseId check. Albums are told apart by their MPRE browse id
+        because their "type" is display text ("Album", "Single", an artist
+        name) rather than a fixed value.
+        """
+        if not isinstance(content, dict):
+            return None
+        if content.get("videoType") == VIDEO_TYPE_PODCAST_EPISODE:
+            # An episode needs its show to be built, and the card does not say
+            # which show it belongs to.
+            return None
+        # ytmusicapi 1.12.2 and later can send thumbnails as None, which
+        # _parse_album would choke on.
+        content = {**content, "thumbnails": content.get("thumbnails") or []}
+        browse_id = str(content.get("browseId") or "")
+        try:
+            if content.get("videoId"):
+                return self._parse_track(content)
+            if content.get("podcastId") or browse_id.startswith(PODCAST_BROWSE_PREFIX):
+                return self._parse_podcast(content)
+            if content.get("playlistId"):
+                # Editorial lists (RDCLAK5uy_), community playlists, personal
+                # mixes (RDTMAK5uy_) and radio (RDAMVM) all land here, and the
+                # playlist routing already resolves every one of them.
+                return self._parse_playlist(content, keep_small_frame=True)
+            if browse_id.startswith("MPRE"):
+                return self._parse_album(content)
+            if browse_id.startswith("UC") and "subscribers" in content:
+                # Artist cards name the artist in "title", which _parse_artist
+                # does not read.
+                return self._parse_artist({**content, "name": content.get("title")})
+        except (InvalidDataError, KeyError, TypeError, ValueError, AttributeError) as err:
+            self.logger.debug("skipping home feed item %r: %s", content.get("title"), err)
+            return None
+        self.logger.debug(
+            "skipping home feed item %r of unknown shape (keys: %s)",
+            content.get("title"),
+            ", ".join(sorted(content)),
+        )
+        return None
+
+    def _home_playlist_credits(self, content: dict[str, Any]) -> list[ItemMapping]:
+        """A home feed playlist's authors as artist mappings, for the AI filter.
+
+        The Playlist model keeps only the owner's name, while the card can
+        also carry the author's channel id, which is the reliable thing to
+        match a blocklist on. Editorial lists, mixes and radio carry no author
+        at all and get an empty list, so the filter never drops them.
+        """
+        authors = content.get("author")
+        if isinstance(authors, (dict, str)):
+            authors = [authors]
+        if not isinstance(authors, list):
+            return []
+        mappings: list[ItemMapping] = []
+        for author in authors:
+            if isinstance(author, str):
+                author = {"name": author}
+            if not isinstance(author, dict):
+                continue
+            author_id = str(author.get("id") or author.get("channelId") or "")
+            name = str(author.get("name") or "")
+            if author_id or name:
+                mappings.append(self._get_item_mapping(MediaType.ARTIST, author_id, name))
+        return mappings
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -3565,44 +3807,81 @@ class YoutubeMusicFreeProvider(MusicProvider):
             # Keep a reference so the task is not garbage collected mid-flight.
             self._ai_blocklist_task = task
 
-    def _is_ai_blocked(self, track: Track) -> bool:
-        """Whether ``track`` is by an artist on the blocklist."""
-        for artist in track.artists or ():
-            artist_id = getattr(artist, "item_id", None)
-            if artist_id and artist_id in self._ai_blocked_channel_ids:
-                return True
-            name = getattr(artist, "name", None)
-            if name and _normalize_artist_name(name) in self._ai_blocked_names:
-                return True
-        return False
+    def _is_blocked_artist(self, artist: Any) -> bool:
+        """Whether one artist (an ItemMapping or an Artist) is on the blocklist."""
+        artist_id = getattr(artist, "item_id", None)
+        if artist_id and artist_id in self._ai_blocked_channel_ids:
+            return True
+        name = getattr(artist, "name", None)
+        return bool(name) and _normalize_artist_name(name) in self._ai_blocked_names
 
-    def _drop_ai_tracks(self, tracks: list[Track], source: str) -> list[Track]:
-        """Remove blocklisted tracks from an auto-generated list.
+    def _is_ai_blocked(self, item: Any, credited_to: list[Any] | None = None) -> bool:
+        """Whether ``item`` is credited to an artist on the blocklist.
 
-        Applied only to lists YouTube generated for us (radio, mixes, similar
-        tracks, recommendations). Search, library and hand-picked playlists are
-        left alone: filtering those would make a deliberate lookup fail to find
-        something the user explicitly asked for.
+        A track or an album matches when any of its artists does, an artist
+        card when the artist itself does. A playlist matches on its author, but
+        the Playlist model keeps only the owner's name and falls back to the
+        provider's own name when there is none, so the caller passes the
+        authors it read from the payload as ``credited_to``. Without them a
+        playlist is never dropped: editorial lists, mixes and radio have no
+        author to blame. Anything else (podcasts) is never dropped either.
+        """
+        if credited_to is None:
+            # Read off the attribute rather than by type, which keeps tracks
+            # matched exactly as before albums joined in. Playlists and
+            # podcasts have no artists attribute.
+            credited_to = (
+                [item] if isinstance(item, Artist) else list(getattr(item, "artists", None) or ())
+            )
+        return any(self._is_blocked_artist(artist) for artist in credited_to)
+
+    def _drop_ai_items(
+        self, items: list[Any], source: str, credited_to: list[list[Any] | None] | None = None
+    ) -> list[Any]:
+        """Remove blocklisted tracks, albums, artists and playlists from an auto-generated list.
+
+        Applied only to lists YouTube generated for us: radio, mixes, similar
+        tracks and the home feed. Search, library, artist pages and hand-picked
+        playlists are left alone: filtering those would make a deliberate
+        lookup fail to find something the user explicitly asked for.
+
+        Every list but the home feed holds tracks only. The home feed also
+        holds albums, artist cards and playlists, and from 1.2.2 those go too
+        when they belong to a blocked artist, since a shelf offering a blocked
+        artist's album is the same unrequested music one click further away.
+        See _is_ai_blocked for what counts as belonging. ``credited_to``, when
+        given, runs parallel to ``items`` and overrides who each item is
+        credited to (None keeps the item's own artists).
         """
         if not self._ai_filter_enabled:
-            return tracks
-        # Ahead of the empty-list exit, not after it. A config with only a
-        # remote URL starts with both sets empty, so gating the refresh on
-        # having entries meant that if the one fetch at startup failed, nothing
-        # ever retried and the filter stayed off for the process lifetime.
+            return items
         # Ahead of the empty-list exit, not after it. A config with only a
         # remote URL starts with both sets empty, so gating the refresh on
         # having entries meant that if the one fetch at startup failed, nothing
         # ever retried and the filter stayed off for the process lifetime.
         self._schedule_blocklist_refresh_if_stale()
         if not self._ai_blocked_channel_ids and not self._ai_blocked_names:
-            return tracks
-        kept = [track for track in tracks if not self._is_ai_blocked(track)]
-        if dropped := len(tracks) - len(kept):
+            return items
+        if credited_to is None:
+            credited_to = [None] * len(items)
+        kept = [
+            item
+            for item, credits in zip(items, credited_to, strict=True)
+            if not self._is_ai_blocked(item, credits)
+        ]
+        if dropped := len(items) - len(kept):
             self.logger.debug(
-                "AI filter removed %d of %d tracks from %s", dropped, len(tracks), source
+                "AI filter removed %d of %d items from %s", dropped, len(items), source
             )
         return kept
+
+    def _drop_ai_tracks(self, tracks: list[Track], source: str) -> list[Track]:
+        """Remove blocklisted tracks from an auto-generated track list.
+
+        The track-only callers (radio, mixes, similar tracks) keep this name;
+        it is _drop_ai_items with nothing but tracks in it.
+        """
+        return self._drop_ai_items(tracks, source)
 
     async def _get_stream_format(self, item_id: str) -> dict[str, Any]:
         """Extract the best audio stream URL via yt-dlp (no cookies required)."""
@@ -3939,8 +4218,14 @@ class YoutubeMusicFreeProvider(MusicProvider):
             artist.metadata.images = self._parse_thumbnails(artist_obj["thumbnails"])
         return artist
 
-    def _parse_playlist(self, playlist_obj: dict) -> Playlist:
-        """Parse a YTM playlist dict into a Playlist model object."""
+    def _parse_playlist(self, playlist_obj: dict, *, keep_small_frame: bool = False) -> Playlist:
+        """Parse a YTM playlist dict into a Playlist model object.
+
+        ``keep_small_frame`` is for home feed cards (issue #96). Elsewhere a
+        playlist whose only cover is a video frame gets Music Assistant's
+        generated collage instead, but a recommendation card gets no collage,
+        so there the frame beats no artwork at all.
+        """
         # ytmusicapi uses different key names depending on context:
         #   get_playlist()  → "id"
         #   search results  → "browseId"  (e.g. "VLPLxxx")
@@ -3950,7 +4235,8 @@ class YoutubeMusicFreeProvider(MusicProvider):
             or playlist_obj.get("playlistId")
             or playlist_obj.get("browseId", "")
         )
-        playlist_name = playlist_obj.get("title", "Unknown Playlist")
+        # ytmusicapi sends the title as None when a home feed card has none.
+        playlist_name = playlist_obj.get("title") or "Unknown Playlist"
         playlist = Playlist(
             item_id=playlist_id,
             provider=self.instance_id,
@@ -3968,7 +4254,9 @@ class YoutubeMusicFreeProvider(MusicProvider):
         if "description" in playlist_obj:
             playlist.metadata.description = playlist_obj["description"]
         if playlist_obj.get("thumbnails"):
-            playlist.metadata.images = self._parse_thumbnails(playlist_obj["thumbnails"])
+            playlist.metadata.images = self._parse_thumbnails(
+                playlist_obj["thumbnails"], keep_small_frame=keep_small_frame
+            )
         authors = playlist_obj.get("author")
         if isinstance(authors, str):
             playlist.owner = authors
@@ -4063,8 +4351,9 @@ class YoutubeMusicFreeProvider(MusicProvider):
     ) -> list[MediaItemImage]:
         """Convert YTM thumbnail list to MediaItemImage list.
 
-        ``keep_small_frame`` is for tracks only: a playlist without a THUMB gets
-        a generated collage from Music Assistant, which beats a 400 px frame.
+        ``keep_small_frame`` is for tracks and home feed cards only: a playlist
+        without a THUMB gets a generated collage from Music Assistant, which
+        beats a 400 px frame, but a recommendation card gets no collage.
         """
         result: list[MediaItemImage] = []
         processed = set()

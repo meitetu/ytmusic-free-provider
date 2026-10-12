@@ -322,6 +322,13 @@ def _install_music_assistant_models() -> None:
         fully_played: bool | None = None
         resume_position_ms: int | None = None
 
+    # Exactly these four fields, on purpose: the ones the provider passes.
+    # Music Assistant 2.9's models (1.1.129.post1) raise TypeError on the
+    # keywords 2.10 added (type, enabled_by_default, supports_provider_filter);
+    # adding those here would let the provider pass one and still go green
+    # while it fails to build rows on 2.9. Keeping the stub at four makes any
+    # new keyword a deliberate decision. Pinned in tests/ma_contract.py.
+    # Issue #96.
     @dataclass
     class _RecommendationFolder:
         item_id: str
@@ -441,6 +448,20 @@ def _install_music_assistant() -> None:
 
         async def unload(self, is_removed: bool = False) -> None:
             return None
+
+        # The Music Assistant 2.10 recommendation hooks, gate included. The
+        # base versions raise once RECOMMENDATIONS is declared, which is the
+        # whole of issue #96: without the gate here a provider that never
+        # overrode them passed every test while 2.10 showed no rows at all.
+        async def get_recommendations(self) -> list:
+            if enums.ProviderFeature.RECOMMENDATIONS in self.supported_features:
+                raise NotImplementedError
+            return []
+
+        async def get_recommendation_items(self, item_id: str) -> list:
+            if enums.ProviderFeature.RECOMMENDATIONS in self.supported_features:
+                raise NotImplementedError
+            return sys.modules["music_assistant_models.media_items"].UniqueList()
 
     music_provider_mod.MusicProvider = _MusicProvider
     models.music_provider = music_provider_mod
