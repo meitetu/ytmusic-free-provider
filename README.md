@@ -46,7 +46,7 @@ Cookie や DB を削除してキャッシュを消す必要はありません。
 外部スクリプトをパイプ実行せず、保存して内容を確認してから実行します。
 
 ```sh
-VERSION='v1.2.2'
+VERSION='v1.2.3'
 curl -fL --proto '=https' --tlsv1.2 \
   "https://raw.githubusercontent.com/meitetu/ytmusic-free-provider/$VERSION/scripts/install_watcher_addon.sh" \
   -o /tmp/install_watcher_addon.sh

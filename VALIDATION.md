@@ -13,6 +13,10 @@
 | 実サーバーのホームフィードキャッシュ | 同一言語のヒット、言語切替、従来キーの排除、アカウント切替を確認 |
 | 実サーバーの従来メタデータキャッシュ | 言語・インスタンス分離、再生時のキャッシュ迂回を確認 |
 | Actionlint / Ruff / compileall | 成功 |
+| 同期・release-only・標準トークン CI 起動ゲート | 10 passed |
+| dash の単体インストーラ / Watcher 生成 / 自動更新 | 47 / 91 / 12 passed、失敗・skip なし |
+| stable 実サーバーでインポート・おすすめフック・認証通知契約 | 成功 |
+| GitHub CI（コードの HEAD `14d7069`） | [成功](https://github.com/meitetu/ytmusic-free-provider/actions/runs/38197441665) |
 
 標準 `GITHUB_TOKEN` による同期 PR と明示的 CI 起動を追加しました。実際の workflow の
 CI 起動スクリプトを `gh` のローカル代替コマンドで実行し、Draft・外部 Fork・不明な
