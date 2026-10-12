@@ -28,13 +28,15 @@ class SyncTests(unittest.TestCase):
         return subprocess.check_output(["git", *args], cwd=self.repo, text=True).strip()
 
     def commit(self, filename, content, message):
+        (self.repo / filename).parent.mkdir(parents=True, exist_ok=True)
         (self.repo / filename).write_text(content, encoding="utf-8")
         self.git("add", "--", filename)
         self.git("commit", "-m", message)
 
-    def sync(self, check=True):
+    def sync(self, check=True, report_workflow_changes=False):
+        args = ["--report-workflow-changes"] if report_workflow_changes else []
         result = subprocess.run(
-            [sys.executable, str(SCRIPT), "main", "upstream"],
+            [sys.executable, str(SCRIPT), "main", "upstream", *args],
             cwd=self.repo,
             text=True,
             capture_output=True,
@@ -57,12 +59,50 @@ class SyncTests(unittest.TestCase):
         self.commit("fix.txt", "upstream fix\n", "upstream fix")
         upstream = self.git("rev-parse", "HEAD")
         self.git("switch", "main")
-        result = self.sync()
+        result = self.sync(report_workflow_changes=True)
         self.assertEqual(result["status"], "merged")
         self.assertEqual((self.repo / "locale.txt").read_text(), "日本語\n")
         self.assertEqual((self.repo / "fix.txt").read_text(), "upstream fix\n")
         self.git("merge-base", "--is-ancestor", upstream, "HEAD")
         self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_standard_token_reports_workflow_changes_without_merging_code(self):
+        self.commit("locale.txt", "日本語\n", "fork locale")
+        fork = self.git("rev-parse", "HEAD")
+        self.git("switch", "upstream")
+        self.commit(".github/workflows/test.yml", "name: new workflow\n", "upstream workflow")
+        self.commit("provider.txt", "new upstream code\n", "upstream code")
+        upstream = self.git("rev-parse", "HEAD")
+        self.git("switch", "main")
+        result = self.sync(report_workflow_changes=True)
+        self.assertEqual(result["status"], "workflow-permission")
+        self.assertEqual((self.repo / "provider.txt").read_text(), "base\n")
+        self.assertEqual((self.repo / "locale.txt").read_text(), "日本語\n")
+        self.assertFalse((self.repo / ".github/workflows/test.yml").exists())
+        report = f".github/upstream-conflicts/{upstream}.md"
+        self.assertEqual(self.git("diff", "--name-only", fork, "HEAD"), report)
+        self.assertIn("Workflows: write", (self.repo / report).read_text())
+        self.assertIn(".github/workflows/test.yml", (self.repo / report).read_text())
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_app_mode_can_merge_workflow_updates(self):
+        self.git("switch", "upstream")
+        self.commit(".github/workflows/test.yml", "name: app update\n", "upstream workflow")
+        upstream = self.git("rev-parse", "HEAD")
+        self.git("switch", "main")
+        self.assertEqual(self.sync()["status"], "merged")
+        self.assertEqual((self.repo / ".github/workflows/test.yml").read_text(), "name: app update\n")
+        self.git("merge-base", "--is-ancestor", upstream, "HEAD")
+
+    def test_standard_token_also_reports_workflow_deletions(self):
+        self.commit(".github/workflows/test.yml", "name: existing\n", "shared workflow")
+        self.git("switch", "upstream")
+        self.git("merge", "--ff-only", "main")
+        self.git("rm", ".github/workflows/test.yml")
+        self.git("commit", "-m", "remove upstream workflow")
+        self.git("switch", "main")
+        self.assertEqual(self.sync(report_workflow_changes=True)["status"], "workflow-permission")
+        self.assertEqual((self.repo / ".github/workflows/test.yml").read_text(), "name: existing\n")
 
     def test_conflict_aborts_merge_and_creates_report_only(self):
         self.commit("provider.txt", "日本語パッチ\n", "fork locale")

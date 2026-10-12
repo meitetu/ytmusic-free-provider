@@ -47,6 +47,7 @@ jobs:
         id: prepare
         env:
           GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+          SYNC_STANDARD_TOKEN: ${{ steps.app.outputs.token == '' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -72,6 +73,9 @@ jobs:
             git switch --detach "origin/$branch"
             if git cat-file -e "HEAD:.github/upstream-conflicts/$upstream_sha.md" 2>/dev/null; then
               status=conflict
+              if git show "HEAD:.github/upstream-conflicts/$upstream_sha.md" | grep -q 'Reason: workflow-permission'; then
+                status=workflow-permission
+              fi
             else
               git merge-base --is-ancestor "$upstream_sha" HEAD
               status=merged
@@ -79,11 +83,15 @@ jobs:
             printf 'status=%s\nbranch=%s\nupstream=%s\n' "$status" "$branch" "$upstream_sha" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          python .github/scripts/prepare_upstream_sync.py origin/main upstream/main > /tmp/upstream-sync.json
+          args=()
+          if [ "$SYNC_STANDARD_TOKEN" = true ]; then args+=(--report-workflow-changes); fi
+          python .github/scripts/prepare_upstream_sync.py origin/main upstream/main "${args[@]}" > /tmp/upstream-sync.json
           jq -r 'to_entries[] | "\(.key)=\(.value)"' /tmp/upstream-sync.json >> "$GITHUB_OUTPUT"
 
       - name: Push only to the fork and open a PR
-        if: steps.prepare.outputs.status == 'merged' || steps.prepare.outputs.status == 'conflict'
+        if: >-
+          steps.prepare.outputs.status == 'merged' || steps.prepare.outputs.status == 'conflict' ||
+          steps.prepare.outputs.status == 'workflow-permission'
         env:
           GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
           SYNC_BRANCH: ${{ steps.prepare.outputs.branch }}
@@ -99,7 +107,7 @@ jobs:
             printf 'Conflicts are never resolved automatically. A conflict PR contains only a report and must stay in draft until manually resolved.\n'
           } > /tmp/upstream-pr-body.md
           args=()
-          if [ "$SYNC_STATUS" = conflict ]; then args+=(--draft); fi
+          if [ "$SYNC_STATUS" != merged ]; then args+=(--draft); fi
           if ! gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$SYNC_BRANCH" \
             --title "Sync upstream ${UPSTREAM_SHA:0:12}" --body-file /tmp/upstream-pr-body.md "${args[@]}"; then
             echo "::error::PR creation failed. Check Settings > Actions > General > Allow GitHub Actions to create and approve pull requests, or configure the optional sync GitHub App. The prepared branch remains in this fork."

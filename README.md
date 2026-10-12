@@ -146,6 +146,9 @@ Cookie を GitHub の Secret、Issue、PR、ログに貼らないでください
   標準の `GITHUB_TOKEN` で動き、App や個人トークンの登録は不要。
   同期ジョブだけに Contents / Pull requests / Actions の write 権限を付ける。
   CI の権限は Contents: read のまま。
+  本家が `.github/workflows` を変更した場合は、標準トークンでそのファイルを push
+  せず、取り込みを中止してレポートだけの Draft PR を作る。管理者が手動で
+  統合するか、下記の Workflows 権限を持つ GitHub App を使用する。
 - 毎日の同期はこの Fork で既定で有効。止める場合は Actions Variable
   `ENABLE_UPSTREAM_SYNC=false` を登録する。未設定または `true` なら動く。
 - GitHub App を利用する場合は、Actions Variable `SYNC_APP_ID` と Secret
